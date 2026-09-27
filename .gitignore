@@ -1,0 +1,18 @@
+# makepkg and CMake output
+src/
+pkg/
+build/
+*.pkg.tar.*
+*.tar.gz
+.SRCINFO
+
+# Local test output
+*.png
+*.log
+__pycache__/
+*.pyc
+
+# Local-only scripts from the original validation and installation
+capture-isolated.sh
+verify-quality.py
+install-system.py

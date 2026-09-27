@@ -1,0 +1,173 @@
+--- a/src/utils/screengrabber.h
++++ b/src/utils/screengrabber.h
+@@ -36,6 +36,9 @@
+ private:
+     void adjustDevicePixelRatio(QPixmap& pixmap);
+     QWidget* createMonitorPreviews(const QPixmap& fullScreenshot);
++    QPixmap nativeSwayScreenshot(int monitorIndex);
++    QPixmap captureSelectedMonitor(const QPixmap& fullScreenshot,
++                                   int monitorIndex);
+     QPixmap cropToMonitor(const QPixmap& fullScreenshot, int monitorIndex);
+     QPixmap windowsScreenshot(int wid);
+     QPixmap x11LegacyScreenshot();
+--- a/src/utils/screengrabber.cpp
++++ b/src/utils/screengrabber.cpp
+@@ -7,6 +7,7 @@
+ #include "utils/systemnotification.h"
+ 
+ #include <QApplication>
++#include <QCoreApplication>
+ #include <QEventLoop>
+ #include <QGuiApplication>
+ #include <QHBoxLayout>
+@@ -18,6 +19,8 @@
+ #include <QPixmap>
+ #include <QProcess>
+ #include <QScreen>
++#include <QStandardPaths>
++#include <QThread>
+ #include <QTimer>
+ #include <QWidget>
+ #include <algorithm>
+@@ -168,7 +171,8 @@
+     // If there's only one monitor, skip selection
+     const QList<QScreen*> screens = QGuiApplication::screens();
+     if (screens.size() == 1) {
+-        return cropToMonitor(fullScreenshot, 0);
++        m_selectedMonitor = 0;
++        return captureSelectedMonitor(fullScreenshot, 0);
+     }
+ 
+     // Capture Active Monitor: auto-select monitor under cursor
+@@ -186,7 +190,7 @@
+         int monitorIndex = screens.indexOf(cursorScreen);
+         if (monitorIndex >= 0) {
+             m_selectedMonitor = monitorIndex;
+-            return cropToMonitor(fullScreenshot, monitorIndex);
++            return captureSelectedMonitor(fullScreenshot, monitorIndex);
+         }
+         // Fall through to manual selection if screen lookup fails
+     }
+@@ -210,11 +214,17 @@
+     loop.exec();
+     m_monitorSelectionLoop = nullptr;
+ 
++    container->hide();
+     delete container;
+     m_monitorSelectionActive = false;
+ 
+     if (m_selectedMonitor >= 0) {
+-        return cropToMonitor(fullScreenshot, m_selectedMonitor);
++        // Let Sway remove the selector surface before capturing the output.
++        QCoreApplication::processEvents();
++#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
++        QThread::msleep(100);
++#endif
++        return captureSelectedMonitor(fullScreenshot, m_selectedMonitor);
+     } else {
+         ok = false;
+         if (m_userCancelled) {
+@@ -245,6 +255,15 @@
+     return screenshot;
+ 
+ #elif defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
++    if (preSelectedMonitor >= 0 &&
++        preSelectedMonitor < QGuiApplication::screens().size()) {
++        m_selectedMonitor = preSelectedMonitor;
++        screenshot = nativeSwayScreenshot(preSelectedMonitor);
++        if (!screenshot.isNull()) {
++            return screenshot;
++        }
++    }
++
+     if (!m_info.waylandDetected() && ConfigHandler().useX11LegacyScreenshot()) {
+         qWarning() << "Using deprecated legacy X11 screenshot method. "
+                       "Consider installing xdg-desktop-portal for your "
+@@ -474,6 +493,87 @@
+         }
+     }
+     return QObject::eventFilter(obj, event);
++}
++
++QPixmap ScreenGrabber::nativeSwayScreenshot(int monitorIndex)
++{
++#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
++    if (qEnvironmentVariable("XDG_SESSION_TYPE") != QLatin1String("wayland") ||
++        QGuiApplication::platformName() != QLatin1String("wayland") ||
++        !qEnvironmentVariable("XDG_CURRENT_DESKTOP")
++           .split(QLatin1Char(':'), Qt::SkipEmptyParts)
++           .contains(QLatin1String("sway"), Qt::CaseInsensitive)) {
++        return QPixmap();
++    }
++
++    const QList<QScreen*> screens = QGuiApplication::screens();
++    if (monitorIndex < 0 || monitorIndex >= screens.size()) {
++        return QPixmap();
++    }
++
++    QScreen* screen = screens[monitorIndex];
++    const QString outputName = screen->name();
++    const QString grim = QStandardPaths::findExecutable(QStringLiteral("grim"));
++    if (outputName.isEmpty() || grim.isEmpty()) {
++        AbstractLogger::warning()
++          << tr("Native Sway capture unavailable; using the portal screenshot");
++        return QPixmap();
++    }
++
++    QProcess process;
++    process.setProgram(grim);
++    process.setArguments({ QStringLiteral("-o"), outputName,
++                           QStringLiteral("-") });
++    process.start();
++    if (!process.waitForStarted(5000) || !process.waitForFinished(30000) ||
++        process.exitStatus() != QProcess::NormalExit ||
++        process.exitCode() != 0) {
++        if (process.state() != QProcess::NotRunning) {
++            process.kill();
++            process.waitForFinished();
++        }
++        AbstractLogger::warning()
++          << tr("Native Sway capture failed for %1: %2")
++               .arg(outputName, QString::fromLocal8Bit(process.readAllStandardError()));
++        return QPixmap();
++    }
++
++    QPixmap screenshot;
++    if (!screenshot.loadFromData(process.readAllStandardOutput(), "PNG")) {
++        AbstractLogger::warning()
++          << tr("Native Sway capture returned an invalid PNG for %1")
++               .arg(outputName);
++        return QPixmap();
++    }
++
++    const QSize expectedSize(
++      qRound(screen->geometry().width() * screen->devicePixelRatio()),
++      qRound(screen->geometry().height() * screen->devicePixelRatio()));
++    if (screenshot.size() != expectedSize) {
++        AbstractLogger::warning()
++          << tr("Native Sway capture size mismatch for %1: %2x%3, expected %4x%5")
++               .arg(outputName)
++               .arg(screenshot.width())
++               .arg(screenshot.height())
++               .arg(expectedSize.width())
++               .arg(expectedSize.height());
++        return QPixmap();
++    }
++
++    screenshot.setDevicePixelRatio(screen->devicePixelRatio());
++    return screenshot;
++#else
++    Q_UNUSED(monitorIndex)
++    return QPixmap();
++#endif
++}
++
++QPixmap ScreenGrabber::captureSelectedMonitor(const QPixmap& fullScreenshot,
++                                               int monitorIndex)
++{
++    QPixmap screenshot = nativeSwayScreenshot(monitorIndex);
++    return screenshot.isNull() ? cropToMonitor(fullScreenshot, monitorIndex)
++                               : screenshot;
+ }
+ 
+ QPixmap ScreenGrabber::cropToMonitor(const QPixmap& fullScreenshot,
